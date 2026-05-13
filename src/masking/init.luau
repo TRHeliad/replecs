@@ -1566,6 +1566,12 @@ function masking_controller.create_exclude_generator(masking: MaskingController,
 
 	local new_generator = mask_generator.create(bitmask, function(generator)
 		local current = generator.bitmask :: utils.Bitmask
+		-- grow the exclude bitmask so bnot's implicit zero-tail covers every currently-tracked player;
+		-- otherwise indices past current.entries read as 0 in bnot and get wrongly excluded from the result.
+		local active_entries = active_members.result.entries
+		if current.entries < active_entries then
+			current:expand(active_entries * 32)
+		end
 		return active_members.result:band(current:bnot())
 	end)
 	new_generator:track(active_members)
