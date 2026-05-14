@@ -763,7 +763,7 @@ function masking_controller.bind_component_generator(
 	end
 
 	generator:track(base_generator)
-	generator:track(masking.active_members_generator)
+	generator:track(entity_lookup.generator)
 	generator.subscribed = subscribed
 
 	return generator
