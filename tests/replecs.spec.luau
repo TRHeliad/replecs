@@ -983,6 +983,186 @@ TEST("member bitmasking", function()
 	end)
 end)
 
+TEST("world include", function()
+	local masking: player_masking.MaskingController = nil :: any
+	local world: jecs.World = nil :: any
+
+	BEFORE_EACH(function()
+		masking = player_masking.create()
+		world = jecs.world()
+	end)
+
+	local function entity_hash(entity: jecs.Entity): string
+		return masking.lookups.entities[entity].storage_group.mask.hash
+	end
+
+	CASE("should be a transparent passthrough of active members when disabled", function()
+		register_members(masking)
+		active_all_members(masking)
+
+		CHECK(masking.include_enabled == false)
+		CHECK(masking.active_members_generator.result:tostring() == mask_hash { 0, 1, 2, 3 })
+		CHECK(
+			masking.replicable_members_generator.result:tostring()
+				== masking.active_members_generator.result:tostring()
+		)
+	end)
+
+	CASE("should restrict replicable members to the include set", function()
+		local m0, m1, m2, m3 = register_members(masking)
+		active_all_members(masking)
+
+		masking:set_world_include {
+			[m0] = true,
+			[m2] = true,
+		}
+		CHECK(masking.include_enabled == true)
+		CHECK(masking.replicable_members_generator.result:tostring() == mask_hash { 0, 2 })
+	end)
+
+	CASE("should narrow an unfiltered entity's storage to the include set", function()
+		local m0, m1, m2, m3 = register_members(masking)
+		active_all_members(masking)
+
+		local entity = world:entity()
+		masking:start_entity(entity, nil)
+		CHECK(entity_hash(entity) == mask_hash { 0, 1, 2, 3 })
+
+		masking:set_world_include {
+			[m0] = true,
+			[m1] = true,
+		}
+		CHECK(entity_hash(entity) == mask_hash { 0, 1 })
+	end)
+
+	CASE("should intersect with a per-entity include filter", function()
+		local m0, m1, m2, m3 = register_members(masking)
+		active_all_members(masking)
+
+		local entity = world:entity()
+		masking:start_entity(entity, {
+			[m0] = true,
+			[m1] = true,
+			[m2] = true,
+		})
+		CHECK(entity_hash(entity) == mask_hash { 0, 1, 2 })
+
+		masking:set_world_include {
+			[m1] = true,
+			[m2] = true,
+			[m3] = true,
+		}
+		CHECK(entity_hash(entity) == mask_hash { 1, 2 })
+	end)
+
+	CASE("should intersect with a per-entity exclude filter", function()
+		local m0, m1, m2, m3 = register_members(masking)
+		active_all_members(masking)
+
+		local entity = world:entity()
+		masking:start_entity(entity, {
+			[m0] = false,
+		})
+		CHECK(entity_hash(entity) == mask_hash { 1, 2, 3 })
+
+		masking:set_world_include {
+			[m0] = true,
+			[m1] = true,
+		}
+		CHECK(entity_hash(entity) == mask_hash { 1 })
+	end)
+
+	CASE("should add and remove members incrementally", function()
+		local m0, m1, m2, m3 = register_members(masking)
+		active_all_members(masking)
+
+		local entity = world:entity()
+		masking:start_entity(entity, nil)
+
+		masking:add_world_include(m0)
+		CHECK(masking.include_enabled == true)
+		CHECK(entity_hash(entity) == mask_hash { 0 })
+
+		masking:add_world_include(m2)
+		CHECK(entity_hash(entity) == mask_hash { 0, 2 })
+
+		masking:remove_world_include(m0)
+		CHECK(entity_hash(entity) == mask_hash { 2 })
+	end)
+
+	CASE("should re-open to all active members when disabled with nil", function()
+		local m0, m1, m2, m3 = register_members(masking)
+		active_all_members(masking)
+
+		local entity = world:entity()
+		masking:start_entity(entity, nil)
+
+		masking:set_world_include {
+			[m0] = true,
+		}
+		CHECK(entity_hash(entity) == mask_hash { 0 })
+
+		masking:set_world_include(nil)
+		CHECK(masking.include_enabled == false)
+		CHECK(entity_hash(entity) == mask_hash { 0, 1, 2, 3 })
+	end)
+
+	CASE("should deny all with an empty include set", function()
+		local m0, m1, m2, m3 = register_members(masking)
+		active_all_members(masking)
+
+		local entity = world:entity()
+		masking:start_entity(entity, nil)
+
+		masking:set_world_include {}
+		CHECK(masking.include_enabled == true)
+		CHECK(masking.replicable_members_generator.result:tostring() == "")
+		CHECK(entity_hash(entity) == "")
+	end)
+
+	CASE("should be orthogonal to member readiness", function()
+		local m0, m1, m2, m3 = register_members(masking)
+		active_all_members(masking)
+
+		masking:set_world_include {
+			[m0] = true,
+		}
+
+		-- m1 is excluded from replication but is still a ready/active member
+		CHECK(masking:member_is_active(m0) == true)
+		CHECK(masking:member_is_active(m1) == true)
+
+		CHECK(masking.replicable_members_generator.result:get(masking.client_indexes[m0]) == true)
+		CHECK(masking.replicable_members_generator.result:get(masking.client_indexes[m1]) == false)
+	end)
+
+	CASE("should remap include bits across compaction", function()
+		local m0, m1, m2, m3 = register_members(masking)
+		active_all_members(masking)
+
+		masking:set_world_include {
+			[m1] = true,
+			[m3] = true,
+		}
+
+		-- create gaps in the index space, then compact to force a renumber + remap
+		masking:unregister_client(m0)
+		masking:unregister_client(m2)
+		masking:compact_members()
+
+		local i1 = masking.client_indexes[m1]
+		local i3 = masking.client_indexes[m3]
+		CHECK(i1 ~= nil)
+		CHECK(i3 ~= nil)
+
+		-- the include must still apply to exactly m1 and m3 under their new indexes
+		CHECK(masking.replicable_members_generator.bitmask:get(i1) == true)
+		CHECK(masking.replicable_members_generator.bitmask:get(i3) == true)
+		CHECK(masking.replicable_members_generator.result:get(i1) == true)
+		CHECK(masking.replicable_members_generator.result:get(i3) == true)
+	end)
+end)
+
 TEST("storage moving", function()
 	CASE("it should move component additions", function() end)
 	CASE("it should move component changes", function() end)
@@ -1503,6 +1683,33 @@ TEST("server -> client replication", function()
 			CHECK(client_component(member, entity1, 2) == nil)
 			CHECK(client_component(member, entity2, 1) == nil)
 		end
+	end)
+
+	CASE("should not send to players outside the world include filter", function()
+		create_test_components(world)
+		server:init()
+
+		local members = create_members_data()
+		activate_members(members)
+		init_member_clients(members)
+
+		-- only members[1] and members[3] may receive replication from this world
+		server:set_world_include {
+			[members[1] :: any] = true,
+			[members[3] :: any] = true,
+		}
+
+		local entity1 = world:entity()
+		server:set_networked(entity1)
+
+		for _, member in members do
+			local buf, variants = server:get_full(member :: any)
+			member.client:apply_full(buf, variants)
+		end
+
+		CHECK(client_entity(members[1], entity1) ~= nil)
+		CHECK(client_entity(members[2], entity1) == nil)
+		CHECK(client_entity(members[3], entity1) ~= nil)
 	end)
 
 	CASE("should send full tags to all players", function()

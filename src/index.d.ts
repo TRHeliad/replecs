@@ -182,6 +182,20 @@ declare namespace Replecs {
     set_custom(entity: Entity, handler: Entity | CustomId): void;
     remove_custom(entity: Entity): void;
 
+    /**
+     * Sets a world-level include filter that gates ALL replication from this
+     * world to the given members, on top of any per-entity/per-component filters.
+     * `undefined` disables it (allow-all, the default); an empty map denies all.
+     *
+     * Orthogonal to `mark_player_ready`: a member must be both ready AND
+     * included to receive anything.
+     */
+    set_world_include(filter?: MemberFilter): void;
+    /** Adds a member to the world include filter, enabling it if disabled. */
+    add_to_world_include(player: Player): void;
+    /** Removes a member from the world include filter. */
+    remove_from_world_include(player: Player): void;
+
     set_serdes<T extends Id>(
       component: InferComponent<T>,
       serdes: SerdesTable<T>,

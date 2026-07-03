@@ -69,6 +69,10 @@ export type ServerImp = {
 	set_custom: (self: Server, entity: Entity, component: Component | CustomId) -> (),
 	remove_custom: (self: Server, entity: Entity) -> (),
 
+	set_world_include: (self: Server, filter: AnyFilter?) -> (),
+	add_to_world_include: (self: Server, player: Player) -> (),
+	remove_from_world_include: (self: Server, player: Player) -> (),
+
 	set_serdes: <T>(self: Server, id: Component<T>, serdes: types.Serdes<T>) -> (),
 	remove_serdes: (self: Server, id: Component) -> (),
 }
@@ -2138,6 +2142,21 @@ end
 
 function server_replicator.remove_player_alias(server: Server, alias: any)
 	server.masking.client_aliases[alias] = nil
+end
+
+-- world include filter: gates ALL replication from this world to the given members, on top
+-- of any per-entity/per-component filters. nil disables it (allow-all). this is orthogonal
+-- to mark_player_ready -- a member must be both ready AND included to receive anything.
+function server_replicator.set_world_include(server: Server, filter: AnyFilter?)
+	server.masking:set_world_include(filter)
+end
+
+function server_replicator.add_to_world_include(server: Server, player: Player)
+	server.masking:add_world_include(player)
+end
+
+function server_replicator.remove_from_world_include(server: Server, player: Player)
+	server.masking:remove_world_include(player)
 end
 
 function server_replicator.register_custom_id(server: Server, custom_id: CustomId)

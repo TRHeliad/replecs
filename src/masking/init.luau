@@ -135,9 +135,12 @@ export type MaskingControllerClass = {
 	compact_count: number,
 	unreplicated: Set<Member>,
 
+	include_enabled: boolean,
+
 	all_members_generator: MaskGeneratorWithBitmask,
 	active_members_generator: MaskGenerator,
 	unactive_members_generator: MaskGeneratorWithBitmask,
+	replicable_members_generator: MaskGeneratorWithBitmask,
 
 	storages: Storages,
 	lookups: LookupsList,
@@ -815,7 +818,7 @@ function masking_controller.update_entity_filter(
 	if filter then
 		generator = masking:create_generator_from_filter(filter)
 	else
-		generator = mask_generator.follow(masking.active_members_generator)
+		generator = mask_generator.follow(masking.replicable_members_generator)
 	end
 
 	local lookup = masking.lookups.entities[entity]
@@ -1402,21 +1405,26 @@ local function remap_bitmask(
 	return result
 end
 
+local function resolve_member_index(masking: MaskingController, member: Member): number?
+	local index = masking.client_indexes[member]
+	if not index then
+		local alias = masking.client_indexes[masking.client_aliases[member]]
+		if alias then
+			if utils.is_client_valid(alias) then
+				index = alias
+			end
+		elseif utils.is_client_valid(member) then
+			masking_controller.register_client(masking, member)
+			index = masking.client_indexes[member]
+		end
+	end
+	return index
+end
+
 local function bitmask_from_set(masking: MaskingController, member_set: { [Member]: boolean }): utils.Bitmask
 	local new_bitmask = utils.bitmask.create(masking.member_count)
 	for member: Member in member_set do
-		local index = masking.client_indexes[member]
-		if not index then
-			local alias = masking.client_indexes[masking.client_aliases[member]]
-			if alias then
-				if utils.is_client_valid(alias) then
-					index = alias
-				end
-			elseif utils.is_client_valid(member) then
-				masking_controller.register_client(masking, member)
-				index = masking.client_indexes[member]
-			end
-		end
+		local index = resolve_member_index(masking, member)
 		if index then
 			new_bitmask:set(index)
 		end
@@ -1529,6 +1537,16 @@ function masking_controller.compact_members(masking: MaskingController)
 	unactive.result = unactive.bitmask
 	active.result = remap_bitmask(active.result, old_indexes, new_indexes, new_count)
 
+	local replicable = masking.replicable_members_generator
+	replicable.bitmask = remap_bitmask(replicable.bitmask, old_indexes, new_indexes, new_count)
+	if masking.include_enabled then
+		replicable.result = remap_bitmask(replicable.result, old_indexes, new_indexes, new_count)
+	else
+		-- disabled: result is a transparent alias of active.result, re-point it at the
+		-- freshly remapped active.result instead of the stale pre-remap object.
+		replicable.result = active.result
+	end
+
 	local new_storages: Storages = {}
 
 	for _, storage in masking.storages do
@@ -1562,19 +1580,19 @@ end
 
 function masking_controller.create_exclude_generator(masking: MaskingController, exclude: MemberFilter)
 	local bitmask = bitmask_from_set(masking, exclude)
-	local active_members = masking.active_members_generator
+	local replicable_members = masking.replicable_members_generator
 
 	local new_generator = mask_generator.create(bitmask, function(generator)
 		local current = generator.bitmask :: utils.Bitmask
 		-- grow the exclude bitmask so bnot's implicit zero-tail covers every currently-tracked player;
 		-- otherwise indices past current.entries read as 0 in bnot and get wrongly excluded from the result.
-		local active_entries = active_members.result.entries
-		if current.entries < active_entries then
-			current:expand(active_entries * 32)
+		local replicable_entries = replicable_members.result.entries
+		if current.entries < replicable_entries then
+			current:expand(replicable_entries * 32)
 		end
-		return active_members.result:band(current:bnot())
+		return replicable_members.result:band(current:bnot())
 	end)
-	new_generator:track(active_members)
+	new_generator:track(replicable_members)
 
 	return new_generator
 end
@@ -1582,13 +1600,13 @@ end
 -- TODO: check for players existing and register them if they don't
 function masking_controller.create_include_generator(masking: MaskingController, include: MemberFilter): MaskGenerator
 	local bitmask = bitmask_from_set(masking, include)
-	local active_members = masking.active_members_generator
+	local replicable_members = masking.replicable_members_generator
 
 	local new_generator = mask_generator.create(bitmask, function(generator)
 		local current = generator.bitmask :: utils.Bitmask
-		return current:band(active_members.result)
+		return current:band(replicable_members.result)
 	end)
-	new_generator:track(active_members)
+	new_generator:track(replicable_members)
 
 	return new_generator
 end
@@ -1616,6 +1634,72 @@ function masking_controller.create_active_generator(masking: MaskingController):
 	new_generator:track(unactive)
 
 	return new_generator
+end
+
+-- the floor every entity/component generator bands against: active members, optionally
+-- intersected with the world include mask. when the include filter is disabled this is a
+-- transparent passthrough of active_members so behaviour is identical to having no filter.
+function masking_controller.create_replicable_generator(masking: MaskingController): MaskGenerator
+	local active = masking.active_members_generator
+	local include_mask = utils.bitmask.create(masking.member_count)
+
+	local new_generator = mask_generator.create(include_mask, function(generator)
+		if not masking.include_enabled then
+			return active.result
+		end
+		-- band reads out-of-range entries as 0, so a narrower include mask correctly
+		-- excludes any member whose index is beyond it (no expand needed, unlike bnot).
+		return active.result:band(generator.bitmask :: utils.Bitmask)
+	end)
+	new_generator:track(active)
+
+	return new_generator
+end
+
+-- sets the world include filter: nil disables it (allow-all), a member set restricts
+-- replication to those members (an empty/emptied set means deny-all). this re-derives
+-- replicable_members and cascades storage moves through the existing generator graph.
+function masking_controller.set_world_include(masking: MaskingController, given_filter: GivenFilter?)
+	local filter = get_usable_filter(given_filter)
+	local replicable = masking.replicable_members_generator
+
+	if filter == nil then
+		masking.include_enabled = false
+		replicable.bitmask = utils.bitmask.create(masking.member_count)
+	else
+		masking.include_enabled = true
+		local new_mask = utils.bitmask.create(masking.member_count)
+		for member, allow in filter do
+			if not allow then
+				continue
+			end
+			local index = resolve_member_index(masking, member)
+			if index then
+				new_mask:set(index)
+			end
+		end
+		replicable.bitmask = new_mask
+	end
+
+	replicable:compute()
+end
+
+function masking_controller.add_world_include(masking: MaskingController, member: Member)
+	masking.include_enabled = true
+	local index = resolve_member_index(masking, member)
+	if index then
+		masking.replicable_members_generator.bitmask:set(index)
+	end
+	masking.replicable_members_generator:compute()
+end
+
+function masking_controller.remove_world_include(masking: MaskingController, member: Member)
+	-- resolve without registering: removing a member that was never registered is a no-op
+	local index = masking.client_indexes[member] or masking.client_indexes[masking.client_aliases[member]]
+	if index then
+		masking.replicable_members_generator.bitmask:clear(index)
+	end
+	masking.replicable_members_generator:compute()
 end
 
 --function masking_controller.register_mask_group(masking: MaskingController, group: Member) end
@@ -1648,6 +1732,8 @@ function masking_controller.unregister_client(masking: MaskingController, member
 	end
 	masking.client_indexes[member] = nil
 	masking.all_members_generator.bitmask:clear(index)
+	-- drop any stale world-include bit so a later reuse of this index isn't wrongly included
+	masking.replicable_members_generator.bitmask:clear(index)
 	masking.active_members_generator:compute()
 end
 
@@ -1691,9 +1777,11 @@ local function create(): MaskingController
 		postponed = {},
 	}
 	self.unreplicated = {}
+	self.include_enabled = false
 	self.all_members_generator = masking_controller.create_all_members_generator(self)
 	self.unactive_members_generator = masking_controller.create_unactive_generator(self)
 	self.active_members_generator = masking_controller.create_active_generator(self)
+	self.replicable_members_generator = masking_controller.create_replicable_generator(self) :: any
 
 	return setmetatable(self, masking_controller) :: any
 end
